@@ -67,20 +67,35 @@ int main(int argc, char** argv)
     auto includeData = readAllBytes(includeInput, includeSize);
     std::string_view include(reinterpret_cast<const char*>(includeData.get()), includeSize);
 
-    if (std::filesystem::is_directory(input))
+    // PES13 patch: the input may be several directories/files separated by ';'
+    // (e.g. the disc files plus the decrypted executable image).
+    std::vector<std::filesystem::path> inputFiles;
+    const std::string inputList(input);
+    const bool scanMode = std::filesystem::is_directory(input) || inputList.find(';') != std::string::npos;
+    for (size_t start = 0; scanMode && start <= inputList.size();)
+    {
+        const size_t end = (std::min)(inputList.find(';', start), inputList.size());
+        const std::filesystem::path root = inputList.substr(start, end - start);
+        if (std::filesystem::is_directory(root))
+        {
+            for (auto& entry : std::filesystem::recursive_directory_iterator(root))
+                if (!entry.is_directory()) inputFiles.push_back(entry.path());
+        }
+        else if (!root.empty())
+            inputFiles.push_back(root);
+        start = end + 1;
+    }
+
+    if (scanMode)
     {
         std::vector<std::unique_ptr<uint8_t[]>> files;
         std::map<XXH64_hash_t, RecompiledShader> shaders;
 
-        for (auto& file : std::filesystem::recursive_directory_iterator(input))
+        for (auto& file : inputFiles)
         {
-            if (std::filesystem::is_directory(file))
-            {
-                continue;
-            }
             
             size_t fileSize = 0;
-            auto fileData = readAllBytes(file.path().string().c_str(), fileSize);
+            auto fileData = readAllBytes(file.string().c_str(), fileSize);
             bool foundAny = false;
 
             for (size_t i = 0; fileSize > sizeof(ShaderContainer) && i < fileSize - sizeof(ShaderContainer) - 1;)
@@ -114,6 +129,7 @@ int main(int argc, char** argv)
         }
 
         std::atomic<uint32_t> progress = 0;
+        std::atomic<uint32_t> failures = 0;
 
         std::for_each(std::execution::par_unseq, shaders.begin(), shaders.end(), [&](auto& hashShaderPair)
             {
@@ -134,7 +150,17 @@ int main(int argc, char** argv)
 #endif
 
                 IDxcBlob* spirv = dxcCompiler.compile(recompiler.out, recompiler.isPixelShader, false, true);
-                assert(spirv != nullptr);
+                if (spirv == nullptr)
+                {
+                    // PES13 patch: keep going; save the HLSL so the failure can be investigated.
+                    const auto dir = std::filesystem::path(output).parent_path() / "failed_shaders";
+                    std::filesystem::create_directories(dir);
+                    const auto path = dir / fmt::format("{:016X}.hlsl", hashShaderPair.first);
+                    writeAllBytes(path.string().c_str(), recompiler.out.data(), recompiler.out.size());
+                    ++failures;
+                    ++progress;
+                    return;
+                }
 
                 bool result = smolv::Encode(spirv->GetBufferPointer(), spirv->GetBufferSize(), shader.spirv, smolv::kEncodeFlagStripDebugInfo);
                 assert(result);
@@ -145,6 +171,12 @@ int main(int argc, char** argv)
                 if ((currentProgress % 10) == 0 || (currentProgress == shaders.size() - 1))
                     fmt::println("Recompiling shaders... {}%", currentProgress / float(shaders.size()) * 100.0f);
             });
+
+        fmt::println("Shaders: {} total, {} failed to compile (see failed_shaders/)", shaders.size(), failures.load());
+
+        // PES13 patch: drop shaders that failed to compile.
+        for (auto it = shaders.begin(); it != shaders.end();)
+            it = it->second.spirv.empty() ? shaders.erase(it) : std::next(it);
 
         fmt::println("Creating shader cache...");
 
@@ -169,6 +201,21 @@ int main(int argc, char** argv)
             spirv.insert(spirv.end(), shader.spirv.begin(), shader.spirv.end());
         }
 
+        f.println("}};");
+
+        // PES13 patch: FNV-1a 64 of each shader's raw microcode (the bytes the GPU loads with
+        // IM_LOAD), parallel to g_shaderCacheEntries. The runtime renders from the command
+        // stream, where only the microcode is visible, and uses this to find the shader.
+        f.println("const uint64_t g_shaderMicrocodeHashes[] = {{");
+        for (auto& [hash, shader] : shaders)
+        {
+            const auto* container = reinterpret_cast<const ShaderContainer*>(shader.data);
+            const auto* header = reinterpret_cast<const Shader*>(shader.data + container->shaderOffset);
+            const uint8_t* code = shader.data + container->virtualSize + header->physicalOffset;
+            uint64_t h = 0xCBF29CE484222325ull;
+            for (uint32_t i = 0; i < header->size; ++i) { h ^= code[i]; h *= 0x100000001B3ull; }
+            f.println("\t0x{:X},", h);
+        }
         f.println("}};");
 
         fmt::println("Compressing DXIL cache...");

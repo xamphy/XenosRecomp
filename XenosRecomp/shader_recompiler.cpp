@@ -1,4 +1,5 @@
-#include "shader_recompiler.h"
+﻿#include "shader_recompiler.h"
+#include "../../../runtime/video/vertex_locations.h" // PES13 patch
 #include "shader_common.h"
 
 static constexpr char SWIZZLES[] = 
@@ -331,7 +332,9 @@ void ShaderRecompiler::recompile(const TextureFetchInstruction& instr, bool bicu
         out += "Bicubic";
 #endif
 
-    print("({0}_Texture{1}DescriptorIndex, {0}_SamplerDescriptorIndex, ", constNamePtr, dimension);
+    // PES13 patch: 1D textures are bound as Wx1 2D textures, so they use the 2D descriptor.
+    print("({0}_Texture{1}DescriptorIndex, {0}_SamplerDescriptorIndex, ", constNamePtr,
+        instr.dimension == TextureDimension::Texture1D ? std::string_view("2D") : dimension);
     printSrcRegister(componentCount);
 
     switch (instr.dimension)
@@ -625,9 +628,11 @@ void ShaderRecompiler::recompile(const AluInstruction& instr)
 
             default:
             {
+                // PES13 patch: exports that are not interpolators (e.g. register 63 =
+                // point size / edge flag / kill vertex) went through an invalid iterator.
+                // TODO: route point size to SV_PointSize (point sprites currently render at size 1).
                 auto findResult = interpolators.find(instr.vectorDest);
-                assert(findResult != interpolators.end());
-                exportRegister = findResult->second;
+                exportRegister = findResult != interpolators.end() ? std::string_view(findResult->second) : std::string_view("oUnusedExport");
                 break;
             }
             }
@@ -1324,14 +1329,13 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
 
             out += '\t';
 
-            for (auto& usageLocation : USAGE_LOCATIONS)
-            {
-                if (usageLocation.usage == vertexElement.usage && usageLocation.usageIndex == vertexElement.usageIndex)
-                {
-                    print("[[vk::location({})]] ", usageLocation.location);
-                    break;
-                }
-            }
+            // PES13 patch: generic location mapping shared with the runtime.
+            const int32_t location = PesVertexLocation(uint32_t(vertexElement.usage), uint32_t(vertexElement.usageIndex));
+            if (location >= 0)
+                print("[[vk::location({})]] ", location);
+            else
+                fmt::println(stderr, "[XenosRecomp] no vertex location for usage {} index {}",
+                    uint32_t(vertexElement.usage), uint32_t(vertexElement.usageIndex));
 
             println("in {0} i{1}{2} : {3}{2},", usageType, USAGE_VARIABLES[uint32_t(vertexElement.usage)],
                 uint32_t(vertexElement.usageIndex), USAGE_SEMANTICS[uint32_t(vertexElement.usage)]);
@@ -1483,6 +1487,7 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
     out += "\tint aL = 0;\n";
     out += "\tbool p0 = false;\n";
     out += "\tfloat ps = 0.0;\n";
+    out += "\tfloat4 oUnusedExport = 0.0; // PES13 patch: sink for unsupported exports\n";
     if (isPixelShader)
     {
 #ifdef UNLEASHED_RECOMP

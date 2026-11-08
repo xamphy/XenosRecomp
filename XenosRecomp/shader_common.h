@@ -71,6 +71,18 @@ float2 getWeights2D(uint resourceDescriptorIndex, uint samplerDescriptorIndex, f
     return select(isnan(texCoord), 0.0, frac(texCoord * getTexture2DDimensions(texture) + offset - 0.5));
 }
 
+// PES13 patch: 1D textures are bound as Wx1 2D textures.
+float4 tfetch1D(uint resourceDescriptorIndex, uint samplerDescriptorIndex, float texCoord)
+{
+    return g_Texture2DDescriptorHeap[resourceDescriptorIndex].Sample(g_SamplerDescriptorHeap[samplerDescriptorIndex], float2(texCoord, 0.5));
+}
+
+float getWeights1D(uint resourceDescriptorIndex, uint samplerDescriptorIndex, float texCoord)
+{
+    Texture2D<float4> texture = g_Texture2DDescriptorHeap[resourceDescriptorIndex];
+    return isnan(texCoord) ? 0.0 : frac(texCoord * getTexture2DDimensions(texture).x - 0.5);
+}
+
 float w0(float a)
 {
     return (1.0f / 6.0f) * (a * (a * (-a + 3.0f) - 3.0f) + 1.0f);
